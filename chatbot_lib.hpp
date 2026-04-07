@@ -238,6 +238,11 @@ inline double RmsEnergy(const int16_t *samples, int n) {
 // VAD state machine.  Feed 20 ms PCM frames via ProcessFrame(); when an
 // utterance is complete it is moved into `ready` and the method returns true.
 struct Vad {
+    // Tunable parameters — defaults match the original compile-time constants.
+    double vad_threshold = kVadThreshold;  // RMS level for voiced frame
+    int    silence_ms    = kSilenceMs;     // silence duration to end utterance
+    int    min_speech_ms = kMinSpeechMs;   // minimum utterance length
+
     std::vector<int16_t> speech_buf;
     std::vector<int16_t> ready;          // filled when ProcessFrame returns true
     int  voiced_frames = 0;
@@ -247,7 +252,7 @@ struct Vad {
     // Returns true when a complete utterance has been moved into `ready`.
     bool ProcessFrame(const int16_t *samples, int n) {
         double rms    = RmsEnergy(samples, n);
-        bool   voiced = (rms >= kVadThreshold);
+        bool   voiced = (rms >= vad_threshold);
 
         if (voiced) {
             if (!in_speech) {
@@ -261,9 +266,9 @@ struct Vad {
         } else if (in_speech) {
             speech_buf.insert(speech_buf.end(), samples, samples + n);
             ++silence_frames;
-            int silence_needed = kSilenceMs / kFrameMs;
+            int silence_needed = silence_ms / kFrameMs;
             if (silence_frames >= silence_needed) {
-                int min_frames = kMinSpeechMs / kFrameMs;
+                int min_frames = min_speech_ms / kFrameMs;
                 if (voiced_frames >= min_frames) {
                     ready      = std::move(speech_buf);
                     speech_buf.clear();

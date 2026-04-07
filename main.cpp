@@ -93,6 +93,11 @@ static nlohmann::json g_model_options = {
     {"repeat_penalty", 1.0},
 };
 
+// ── VAD tuning params (overridable via YAML config) ───────────────────────────
+static double g_vad_threshold = kVadThreshold;
+static int    g_silence_ms    = kSilenceMs;
+static int    g_min_speech_ms = kMinSpeechMs;
+
 // Pre-synthesized greeting — generated once at startup so calls start instantly.
 static std::vector<int16_t> g_greeting_pcm;
 static std::string          g_greeting_text;
