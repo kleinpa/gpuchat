@@ -50,15 +50,13 @@ bazel build -c opt //:offhook
 # Minimal — all services on localhost with defaults
 bazel run //:offhook
 
-# Custom endpoints, model, and config file
+# Custom endpoints and config file
 bazel run //:offhook -- \
   --whisper     whisper:10300 \
   --ollama      http://ollama:11434 \
   --piper       piper:10200 \
-  --model       gemma3:1b \
   --config_file bot_config.yaml \
-  --port        5060 \
-  --max_calls   16
+  --port        5060
 ```
 
 Dial in with any SIP softphone (Linphone, Zoiper, Baresip, etc.) using
@@ -71,12 +69,10 @@ Dial in with any SIP softphone (Linphone, Zoiper, Baresip, etc.) using
 | `--whisper`     | `whisper:10300`       | Wyoming faster-whisper endpoint (`host:port`)    |
 | `--ollama`      | `http://ollama:11434` | Ollama HTTP endpoint                             |
 | `--piper`       | `piper:10200`         | Wyoming Piper TTS endpoint (`host:port`)         |
-| `--model`       | `qwen3.5:9b`          | Ollama model name (overridden by `config_file`)  |
 | `--config_file` | _(empty)_             | Path to YAML config file (see below)             |
 | `--pbx`         | _(empty)_             | SIP host for call transfers (e.g. `192.168.1.1`) |
 | `--port`        | `5060`                | SIP UDP listen port                              |
 | `--public_addr` | _(empty)_             | Public IP for NAT/SDP                            |
-| `--max_calls`   | `8`                   | Maximum simultaneous calls                       |
 
 ## Config file
 
@@ -84,8 +80,8 @@ All behaviour is controlled through a YAML file passed with `--config_file`.
 All fields are optional; omitted ones use built-in defaults.
 
 ```yaml
-# Ollama model name (overrides --model flag)
-model: gemma3:1b
+# Ollama model name (default: gemma3:1b)
+# model: gemma3:1b
 
 # System prompt — multi-line supported
 system_prompt: |
@@ -94,6 +90,15 @@ system_prompt: |
 
 # Prompt used to generate the pre-recorded startup greeting
 greeting_prompt: Greet the caller warmly in one short sentence.
+
+# Maximum simultaneous SIP calls (default: 8)
+# max_calls: 8
+
+# VAD tuning
+# vad:
+#   threshold: 500     # RMS level for voiced frame; lower = more sensitive
+#   silence_ms: 600    # ms of silence to end an utterance
+#   min_speech_ms: 200 # minimum utterance length; shorter bursts discarded
 
 # Model options — forwarded verbatim to Ollama's /api/chat "options" object.
 # Any Ollama option can be added here without recompiling.
@@ -118,12 +123,12 @@ conversation history.
 
 ## VAD tuning
 
-Voice activity detection uses a simple RMS energy threshold. Three constants
-in `chatbot_lib.hpp` control behaviour:
+Voice activity detection uses a simple RMS energy threshold, configurable via
+the `vad` section of the config file:
 
-- `kVadThreshold` (default 500): RMS level above which a frame is considered
+- `threshold` (default 500): RMS level above which a frame is considered
   voiced. Lower = more sensitive.
-- `kSilenceMs` (default 600): milliseconds of silence required to end an
+- `silence_ms` (default 600): milliseconds of silence required to end an
   utterance and trigger recognition.
-- `kMinSpeechMs` (default 200): minimum utterance length; shorter bursts are
+- `min_speech_ms` (default 200): minimum utterance length; shorter bursts are
   discarded.

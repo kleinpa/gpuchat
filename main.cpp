@@ -15,7 +15,7 @@
 //   • Piper synthesis starts on the first complete sentence from Ollama,
 //     not after the full LLM response.  Sentences are split on '.', '!', '?'.
 //   • PCM from Piper is queued in kFrameSamples-sized chunks.
-//   • VAD uses a simple RMS energy threshold; silence for kSilenceMs ms
+//   • VAD uses a simple RMS energy threshold; silence for vad.silence_ms ms
 //     triggers recognition.
 //
 // Concurrency
@@ -65,24 +65,22 @@ ABSL_FLAG(std::string, ollama,      "http://ollama:11434",
           "Ollama HTTP endpoint");
 ABSL_FLAG(std::string, piper,       "piper:10200",
           "Wyoming piper TTS endpoint (host:port)");
-ABSL_FLAG(std::string, model,       "qwen3.5:9b",
-          "Ollama model name");
 ABSL_FLAG(std::string, config_file, "",
-          "Path to YAML config file (system_prompt, greeting_prompt, model params)");
+          "Path to YAML config file (model, system_prompt, greeting_prompt, vad, options)");
 ABSL_FLAG(std::string, pbx,        "",
           "SIP host for call transfers (e.g. 192.168.1.1 or pbx.local)");
 ABSL_FLAG(int,         port,        5060, "SIP listen port (UDP)");
 ABSL_FLAG(std::string, public_addr, "",
           "Public IP to advertise in SDP/Contact (for NAT)");
-ABSL_FLAG(int,         max_calls,   8,    "Maximum simultaneous SIP calls");
 
 // ── Runtime globals ───────────────────────────────────────────────────────────
 static std::string g_whisper_addr;  // host:port for Wyoming faster-whisper
 static std::string g_ollama_url;
 static std::string g_piper_addr;    // host:port for Wyoming piper
 static std::string g_pbx_host;      // SIP host used when building transfer URIs
-static std::string g_model;
+static std::string g_model         = "gemma3:1b";
 static std::string g_system_prompt;
+static int         g_max_calls     = 8;
 
 // ── Model options (populated from YAML config; passed verbatim to Ollama) ─────
 static nlohmann::json g_model_options = {
@@ -92,6 +90,11 @@ static nlohmann::json g_model_options = {
     {"min_p",          0.01},
     {"repeat_penalty", 1.0},
 };
+
+// ── VAD tuning params (overridable via YAML config) ───────────────────────────
+static double g_vad_threshold = kVadThreshold;
+static int    g_silence_ms    = kSilenceMs;
+static int    g_min_speech_ms = kMinSpeechMs;
 
 // Pre-synthesized greeting — generated once at startup so calls start instantly.
 static std::vector<int16_t> g_greeting_pcm;
@@ -757,6 +760,9 @@ public:
                 if (!session_) {
                     session_ = std::make_unique<Session>();
                     session_->caller = ci.remoteUri;
+                    session_->vad.vad_threshold = g_vad_threshold;
+                    session_->vad.silence_ms    = g_silence_ms;
+                    session_->vad.min_speech_ms = g_min_speech_ms;
                     pjsua_call_id cid = getId();
                     session_->transfer_fn = [cid](const std::string &ext) {
                         std::string uri = "sip:" + ext
@@ -828,10 +834,8 @@ int main(int argc, char *argv[]) {
     g_ollama_url   = absl::GetFlag(FLAGS_ollama);
     g_piper_addr   = absl::GetFlag(FLAGS_piper);
     g_pbx_host     = absl::GetFlag(FLAGS_pbx);
-    g_model        = absl::GetFlag(FLAGS_model);
     int sip_port  = absl::GetFlag(FLAGS_port);
     std::string public_addr = absl::GetFlag(FLAGS_public_addr);
-    int max_calls = absl::GetFlag(FLAGS_max_calls);
 
     static constexpr char kDefaultSystemPrompt[] =
         "You are a helpful voice assistant answering a phone call. "
@@ -860,6 +864,16 @@ int main(int argc, char *argv[]) {
                 greeting_prompt = cfg["greeting_prompt"].as<std::string>();
             if (cfg["model"] && !cfg["model"].as<std::string>().empty())
                 g_model = cfg["model"].as<std::string>();
+            if (cfg["max_calls"] && cfg["max_calls"].IsScalar())
+                g_max_calls = cfg["max_calls"].as<int>();
+
+            // VAD tuning — all three fields are optional.
+            if (cfg["vad"] && cfg["vad"].IsMap()) {
+                const YAML::Node &vad = cfg["vad"];
+                if (vad["threshold"])  g_vad_threshold = vad["threshold"].as<double>();
+                if (vad["silence_ms"]) g_silence_ms    = vad["silence_ms"].as<int>();
+                if (vad["min_speech_ms"]) g_min_speech_ms = vad["min_speech_ms"].as<int>();
+            }
 
             // Any key under the "options" mapping is forwarded to Ollama.
             // Values are passed as-is; yaml-cpp preserves numeric types.
@@ -917,7 +931,7 @@ int main(int argc, char *argv[]) {
         ep.libCreate();
 
         pj::EpConfig cfg;
-        cfg.uaConfig.maxCalls      = max_calls;
+        cfg.uaConfig.maxCalls      = g_max_calls;
         cfg.logConfig.level        = 3;
         cfg.logConfig.consoleLevel = 3;
         cfg.medConfig.clockRate    = kAudioRate;
