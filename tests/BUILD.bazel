@@ -5,6 +5,28 @@ cc_test(
     srcs = ["test_chatbot.cpp"],
     deps = [
         "//:chatbot_lib",
+        "//:wyoming_lib",
         "@googletest//:gtest_main",
+    ],
+)
+
+# End-to-end SIP + Opus codec test.
+#
+# Uses two accounts inside a single PJSUA2 Endpoint (loopback call) to
+# exercise the Opus codec link path.  LLM / STT / TTS are not involved.
+# If libopus.a is missing or has unresolved symbols, this test will fail
+# to negotiate media even though the unit tests in test_chatbot pass fine.
+cc_test(
+    name = "test_sip_e2e",
+    srcs = ["test_sip_e2e.cpp"],
+    linkopts = [
+        "-ldl",
+        "-lpthread",
+        "-lm",
+        "-lrt",
+    ],
+    deps = [
+        "@googletest//:gtest_main",
+        "@pjsip",
     ],
 )

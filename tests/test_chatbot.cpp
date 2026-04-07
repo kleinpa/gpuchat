@@ -1,4 +1,4 @@
-// test_chatbot.cpp — unit tests for chatbot_lib.hpp
+// test_chatbot.cpp — unit tests for chatbot_lib.hpp and wyoming_lib.hpp
 //
 // Tests cover every pure function in chatbot_lib.hpp:
 //   • ParseUrl           — URL parsing
@@ -12,14 +12,24 @@
 //   • RmsEnergy          — VAD energy computation
 //   • Vad                — full VAD state-machine
 //   • AudioQueue         — thread-safe sample queue
+//
+// And end-to-end tests for the Wyoming protocol client (wyoming_lib.hpp):
+//   • WyomingTranscribe  — STT via mock Wyoming faster-whisper server
+//   • WyomingSynthesize  — TTS via mock Wyoming piper server
+//   • Pipeline           — VAD → mock STT → mock LLM → mock TTS → AudioQueue
 
 #include "chatbot_lib.hpp"
+#include "wyoming_lib.hpp"
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
+#include <arpa/inet.h>
 #include <cmath>
 #include <cstring>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <thread>
 #include <vector>
 
@@ -682,3 +692,420 @@ TEST(AudioQueue, LargeFrameRoundTrip) {
 // (LooksNumeric, BuildOptionsJson, LoadYaml removed — superseded by
 //  nlohmann_json and yaml-cpp; tested via integration rather than unit tests.)
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Wyoming protocol helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// MockServer spins up a TCP listener on an OS-assigned loopback port.
+// Each call to Serve() accepts one connection, runs the provided handler,
+// and closes the connection.
+
+namespace {
+
+class MockServer {
+public:
+    // Creates and binds the listening socket on 127.0.0.1:0.
+    // Throws std::runtime_error on failure.
+    MockServer() {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) throw std::runtime_error("socket");
+        int one = 1;
+        setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+        struct sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port        = 0;
+        if (bind(listen_fd_, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0)
+            throw std::runtime_error("bind");
+        if (listen(listen_fd_, 1) < 0)
+            throw std::runtime_error("listen");
+
+        socklen_t len = sizeof(addr);
+        getsockname(listen_fd_, reinterpret_cast<struct sockaddr *>(&addr), &len);
+        port_ = ntohs(addr.sin_port);
+    }
+
+    ~MockServer() {
+        if (listen_fd_ >= 0) close(listen_fd_);
+    }
+
+    int port() const { return port_; }
+
+    // Accept one connection, run handler(client_fd), close client_fd.
+    void Serve(std::function<void(int)> handler) {
+        int client = accept(listen_fd_, nullptr, nullptr);
+        if (client < 0) return;
+        handler(client);
+        close(client);
+    }
+
+private:
+    int listen_fd_ = -1;
+    int port_      = 0;
+};
+
+// Receive exactly n bytes into buf; returns true on success.
+[[maybe_unused]] static bool RecvAll(int fd, void *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = recv(fd, static_cast<char *>(buf) + got, n - got, 0);
+        if (r <= 0) return false;
+        got += static_cast<size_t>(r);
+    }
+    return true;
+}
+
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ParseHostPort
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(ParseHostPort, WithPort) {
+    auto [h, p] = ParseHostPort("myhost:1234", 9999);
+    EXPECT_EQ(h, "myhost");
+    EXPECT_EQ(p, 1234);
+}
+
+TEST(ParseHostPort, WithoutPort) {
+    auto [h, p] = ParseHostPort("myhost", 9999);
+    EXPECT_EQ(h, "myhost");
+    EXPECT_EQ(p, 9999);
+}
+
+TEST(ParseHostPort, IPv4WithPort) {
+    auto [h, p] = ParseHostPort("127.0.0.1:5555", 80);
+    EXPECT_EQ(h, "127.0.0.1");
+    EXPECT_EQ(p, 5555);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WyomingTranscribe — end-to-end with mock STT server
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Mock Wyoming faster-whisper server that accepts one audio-chunk + audio-stop
+// and replies with a "transcript" event.
+static void ServeMockStt(int client_fd, const std::string &transcript) {
+    // Drain all incoming frames until audio-stop.
+    for (int i = 0; i < 64; i++) {
+        std::string dj;
+        std::vector<uint8_t> pl;
+        std::string type = WyomingRecv(client_fd, dj, pl);
+        if (type.empty() || type == "audio-stop") break;
+    }
+    // Send transcript.
+    std::string data = "{\"text\":\"" + transcript + "\"}";
+    WyomingSend(client_fd, "transcript", data);
+}
+
+TEST(WyomingTranscribe, ReturnsTranscript) {
+    MockServer server;
+    std::string expected = "Hello world";
+
+    std::thread t([&] { server.Serve([&](int fd) { ServeMockStt(fd, expected); }); });
+
+    // Build a minimal voiced PCM utterance.
+    std::vector<int16_t> pcm(kFrameSamples, 1000);
+
+    std::string result = WyomingTranscribe(pcm, "127.0.0.1", server.port());
+    t.join();
+
+    EXPECT_EQ(result, expected);
+}
+
+TEST(WyomingTranscribe, EmptyPcmReturnsEmpty) {
+    // Empty PCM must not open a connection at all.
+    std::vector<int16_t> pcm;
+    std::string result = WyomingTranscribe(pcm, "127.0.0.1", 0 /*unreachable*/);
+    EXPECT_TRUE(result.empty());
+}
+
+TEST(WyomingTranscribe, SendsCorrectSampleRate) {
+    // Verify the audio-chunk header carries kAudioRate.
+    MockServer server;
+    std::string received_rate;
+
+    std::thread t([&] {
+        server.Serve([&](int fd) {
+            std::string dj;
+            std::vector<uint8_t> pl;
+            std::string type = WyomingRecv(fd, dj, pl);
+            // Extract "rate" from the data JSON of the audio-chunk.
+            if (type == "audio-chunk") {
+                auto pos = dj.find("\"rate\":");
+                if (pos != std::string::npos)
+                    received_rate = dj.substr(pos + 7, dj.find(',', pos + 7) - pos - 7);
+            }
+            // Drain audio-stop and reply.
+            for (int i = 0; i < 4; i++) {
+                std::string dj2; std::vector<uint8_t> pl2;
+                if (WyomingRecv(fd, dj2, pl2) == "audio-stop") break;
+            }
+            WyomingSend(fd, "transcript", "{\"text\":\"ok\"}");
+        });
+    });
+
+    std::vector<int16_t> pcm(kFrameSamples, 500);
+    WyomingTranscribe(pcm, "127.0.0.1", server.port());
+    t.join();
+
+    EXPECT_EQ(received_rate, std::to_string(kAudioRate));
+}
+
+TEST(WyomingTranscribe, SendsRawPcmPayload) {
+    // The audio-chunk payload must contain the exact raw s16le bytes.
+    MockServer server;
+    std::vector<uint8_t> received_payload;
+
+    std::thread t([&] {
+        server.Serve([&](int fd) {
+            std::string dj;
+            std::vector<uint8_t> pl;
+            std::string type = WyomingRecv(fd, dj, pl);
+            if (type == "audio-chunk") received_payload = pl;
+            // Drain audio-stop and reply.
+            for (int i = 0; i < 4; i++) {
+                std::string dj2; std::vector<uint8_t> pl2;
+                if (WyomingRecv(fd, dj2, pl2) == "audio-stop") break;
+            }
+            WyomingSend(fd, "transcript", "{\"text\":\"ok\"}");
+        });
+    });
+
+    std::vector<int16_t> pcm = {100, -200, 300, -400};
+    WyomingTranscribe(pcm, "127.0.0.1", server.port());
+    t.join();
+
+    ASSERT_EQ(received_payload.size(), pcm.size() * sizeof(int16_t));
+    // Compare byte-by-byte.
+    const uint8_t *expected = reinterpret_cast<const uint8_t *>(pcm.data());
+    for (size_t i = 0; i < received_payload.size(); i++)
+        EXPECT_EQ(received_payload[i], expected[i]) << "at byte " << i;
+}
+
+TEST(WyomingTranscribe, ErrorEventReturnsEmpty) {
+    // If the server sends "error" instead of "transcript", result must be "".
+    MockServer server;
+    std::thread t([&] {
+        server.Serve([&](int fd) {
+            // Drain all frames.
+            for (int i = 0; i < 8; i++) {
+                std::string dj; std::vector<uint8_t> pl;
+                if (WyomingRecv(fd, dj, pl) == "audio-stop") break;
+            }
+            WyomingSend(fd, "error", "{\"text\":\"internal error\"}");
+        });
+    });
+
+    std::vector<int16_t> pcm(kFrameSamples, 1000);
+    std::string result = WyomingTranscribe(pcm, "127.0.0.1", server.port());
+    t.join();
+
+    EXPECT_TRUE(result.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WyomingSynthesize — end-to-end with mock TTS server
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Mock Wyoming piper server: accepts a synthesize request and sends back a
+// small PCM chunk at the given sample rate.
+static void ServeMockTts(int client_fd,
+                          const std::vector<int16_t> &pcm_to_send,
+                          int rate = kAudioRate) {
+    // Drain synthesize request.
+    {
+        std::string dj; std::vector<uint8_t> pl;
+        WyomingRecv(client_fd, dj, pl);  // "synthesize"
+    }
+    // audio-start
+    std::string start_data = "{\"rate\":" + std::to_string(rate)
+                           + ",\"width\":2,\"channels\":1}";
+    WyomingSend(client_fd, "audio-start", start_data);
+    // audio-chunk
+    const void *raw = pcm_to_send.data();
+    size_t raw_len  = pcm_to_send.size() * sizeof(int16_t);
+    WyomingSend(client_fd, "audio-chunk", "", raw, raw_len);
+    // audio-stop
+    WyomingSend(client_fd, "audio-stop", "");
+}
+
+TEST(WyomingSynthesize, ReturnsPcm) {
+    MockServer server;
+    std::vector<int16_t> expected = {100, 200, 300, -100, -200};
+
+    std::thread t([&] {
+        server.Serve([&](int fd) { ServeMockTts(fd, expected); });
+    });
+
+    auto result = WyomingSynthesize("Hello.", "127.0.0.1", server.port());
+    t.join();
+
+    EXPECT_EQ(result, expected);
+}
+
+TEST(WyomingSynthesize, EmptyTextReturnsEmpty) {
+    auto result = WyomingSynthesize("", "127.0.0.1", 0 /*unreachable*/);
+    EXPECT_TRUE(result.empty());
+}
+
+TEST(WyomingSynthesize, SendsSynthesizeRequest) {
+    // Verify the request contains the text and channels field.
+    MockServer server;
+    std::string received_text;
+
+    std::thread t([&] {
+        server.Serve([&](int fd) {
+            // Read the synthesize request (don't call ServeMockTts which would
+            // try to read a second synthesize frame).
+            std::string dj; std::vector<uint8_t> pl;
+            std::string type = WyomingRecv(fd, dj, pl);
+            if (type == "synthesize") received_text = JsonGetString(dj, "text");
+            // Reply with an empty audio sequence.
+            WyomingSend(fd, "audio-start",
+                        "{\"rate\":" + std::to_string(kAudioRate) + ",\"channels\":1}");
+            WyomingSend(fd, "audio-stop", "");
+        });
+    });
+
+    WyomingSynthesize("Test sentence.", "127.0.0.1", server.port());
+    t.join();
+
+    EXPECT_EQ(received_text, "Test sentence.");
+}
+
+TEST(WyomingSynthesize, DownsamplesWhenRateDiffers) {
+    // If the server returns audio at 2× kAudioRate, the result should be ½ the length.
+    MockServer server;
+    int double_rate = kAudioRate * 2;
+    // 8 samples at double rate → 4 samples at kAudioRate after 2× decimation.
+    std::vector<int16_t> hi_rate_pcm = {10, 20, 30, 40, 50, 60, 70, 80};
+
+    std::thread t([&] {
+        server.Serve([&](int fd) { ServeMockTts(fd, hi_rate_pcm, double_rate); });
+    });
+
+    auto result = WyomingSynthesize("Text.", "127.0.0.1", server.port());
+    t.join();
+
+    // Every other sample is kept (step = 2).
+    ASSERT_EQ(result.size(), 4u);
+    EXPECT_EQ(result[0], 10);
+    EXPECT_EQ(result[1], 30);
+    EXPECT_EQ(result[2], 50);
+    EXPECT_EQ(result[3], 70);
+}
+
+TEST(WyomingSynthesize, MultipleChunksAreConcat) {
+    // TTS servers may send many small audio-chunks; all must be concatenated.
+    MockServer server;
+    std::vector<int16_t> chunk_a = {1, 2, 3};
+    std::vector<int16_t> chunk_b = {4, 5, 6};
+
+    std::thread t([&] {
+        server.Serve([&](int fd) {
+            // Drain synthesize.
+            { std::string dj; std::vector<uint8_t> pl; WyomingRecv(fd, dj, pl); }
+            // audio-start
+            WyomingSend(fd, "audio-start",
+                        "{\"rate\":" + std::to_string(kAudioRate) + ",\"channels\":1}");
+            // Two audio-chunk messages.
+            WyomingSend(fd, "audio-chunk", "",
+                        chunk_a.data(), chunk_a.size() * sizeof(int16_t));
+            WyomingSend(fd, "audio-chunk", "",
+                        chunk_b.data(), chunk_b.size() * sizeof(int16_t));
+            WyomingSend(fd, "audio-stop", "");
+        });
+    });
+
+    auto result = WyomingSynthesize("Two chunks.", "127.0.0.1", server.port());
+    t.join();
+
+    EXPECT_THAT(result, ElementsAre(1, 2, 3, 4, 5, 6));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// End-to-end pipeline: VAD → mock STT → mock LLM → mock TTS → AudioQueue
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(Pipeline, VADToSTTToLLMToTTSToAudioQueue) {
+    // ── Mock STT server ──────────────────────────────────────────────────────
+    MockServer stt_server;
+    const std::string kTranscript = "What time is it?";
+
+    std::thread stt_thread([&] {
+        stt_server.Serve([&](int fd) { ServeMockStt(fd, kTranscript); });
+    });
+
+    // ── Mock LLM (inline — no network needed) ───────────────────────────────
+    // Simulates the sentence-splitting step: given a user utterance, emit one
+    // sentence that the TTS mock will handle.
+    const std::string kReply = "It is three o'clock.";
+    auto mock_llm = [&](const std::string & /*user_text*/,
+                        std::function<void(const std::string &)> on_sentence) {
+        on_sentence(kReply);
+    };
+
+    // ── Mock TTS server (one connection per sentence) ────────────────────────
+    MockServer tts_server;
+    // Synthesized response: a simple 1-frame PCM burst.
+    std::vector<int16_t> tts_pcm(kFrameSamples, 4000);
+
+    // Collect sentences from the LLM so we know how many TTS connections to serve.
+    std::vector<std::string> sentences;
+
+    // ── Simulate a voiced utterance via VAD ─────────────────────────────────
+    Vad vad;
+    AudioQueue audio_out;
+    bool utterance_ready = false;
+
+    // Feed voiced frames (amplitude well above kVadThreshold).
+    int voiced_frames = kMinSpeechMs / kFrameMs + 5;
+    auto voiced_frame = std::vector<int16_t>(kFrameSamples, 10000);
+    for (int i = 0; i < voiced_frames; i++)
+        vad.ProcessFrame(voiced_frame.data(), kFrameSamples);
+
+    // Feed silence until VAD fires.
+    auto silent_frame = std::vector<int16_t>(kFrameSamples, 0);
+    for (int i = 0; i < kSilenceMs / kFrameMs + 2; i++) {
+        if (vad.ProcessFrame(silent_frame.data(), kFrameSamples)) {
+            utterance_ready = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(utterance_ready) << "VAD did not fire";
+
+    // ── Run the pipeline stages ──────────────────────────────────────────────
+    // Stage 1: STT — transcribe the VAD utterance.
+    std::string transcript = WyomingTranscribe(
+        vad.ready, "127.0.0.1", stt_server.port());
+    EXPECT_EQ(transcript, kTranscript);
+
+    // Stage 2: LLM — generate response sentences from the transcript.
+    mock_llm(transcript, [&](const std::string &s) { sentences.push_back(s); });
+    ASSERT_FALSE(sentences.empty());
+
+    // Start TTS mock server — exactly one connection per sentence.
+    std::thread tts_thread([&] {
+        for (size_t i = 0; i < sentences.size(); i++)
+            tts_server.Serve([&](int fd) { ServeMockTts(fd, tts_pcm); });
+    });
+
+    // Stage 3: TTS — synthesize each sentence and push into AudioQueue.
+    for (const auto &sentence : sentences) {
+        auto pcm = WyomingSynthesize(sentence, "127.0.0.1", tts_server.port());
+        EXPECT_FALSE(pcm.empty());
+        audio_out.Push(pcm.data(), pcm.size());
+    }
+
+    // ── Verify AudioQueue received the synthesized audio ─────────────────────
+    EXPECT_GT(audio_out.Size(), 0u);
+    std::vector<int16_t> out(audio_out.Size());
+    audio_out.Pop(out.data(), out.size());
+    // All samples must come from the TTS mock (amplitude 4000).
+    for (auto s : out) EXPECT_EQ(s, 4000);
+
+    stt_thread.join();
+    tts_thread.join();
+}

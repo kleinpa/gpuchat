@@ -1,0 +1,11 @@
+--- a/pjmedia/src/pjmedia-codec/opus.c
++++ b/pjmedia/src/pjmedia-codec/opus.c
+@@ -28,7 +28,7 @@
+
+ #if defined(PJMEDIA_HAS_OPUS_CODEC) && (PJMEDIA_HAS_OPUS_CODEC!=0)
+
+-#include <opus/opus.h>
++#include <opus.h>
+
+ #define THIS_FILE "opus.c"
+

@@ -10,10 +10,21 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-# ── offhook binary ────────────────────────────────────────────────────────
+# ── Wyoming protocol client library ──────────────────────────────────────────
+# Network-I/O layer: Wyoming TCP helpers + WyomingTranscribe / WyomingSynthesize.
+# Depends on chatbot_lib for kAudioRate, JsonGetString, JsonEscape.
+
+cc_library(
+    name = "wyoming_lib",
+    hdrs = ["wyoming_lib.hpp"],
+    deps = [":chatbot_lib"],
+    visibility = ["//visibility:public"],
+)
+
+# ── sloperator binary ────────────────────────────────────────────────────────
 
 cc_binary(
-    name = "offhook",
+    name = "sloperator",
     srcs = ["main.cpp"],
     linkopts = [
         "-ldl",
@@ -22,10 +33,20 @@ cc_binary(
         "-lrt",
         "-static-libstdc++",
         "-static-libgcc",
+        # gold with --start-lib treats :silk as a lazy archive, so silk_x86_rtcd's
+        # references to silk_NSQ_c etc. are unresolved when the SIMD .o files are
+        # processed.  Force-include the symbols that silk_x86_rtcd needs so gold
+        # pulls in the silk objects before the SIMD files are processed.
+        "-Wl,-u,silk_NSQ_c",
+        "-Wl,-u,silk_NSQ_del_dec_c",
+        "-Wl,-u,silk_VQ_WMat_EC_c",
+        "-Wl,-u,silk_noise_shape_quantizer",
+        "-Wl,-u,silk_inner_product_FLP_c",
     ],
     visibility = ["//visibility:public"],
     deps = [
         ":chatbot_lib",
+        ":wyoming_lib",
         "@abseil-cpp//absl/flags:flag",
         "@abseil-cpp//absl/flags:parse",
         "@abseil-cpp//absl/flags:usage",
@@ -42,17 +63,17 @@ cc_binary(
 # ── OCI container image ───────────────────────────────────────────────────────
 
 pkg_tar(
-    name = "offhook_layer",
-    srcs = [":offhook"],
+    name = "sloperator_layer",
+    srcs = [":sloperator"],
     package_dir = "/usr/local/bin",
 )
 
 oci_image(
     name = "image",
     base = "@distroless_cc",
-    entrypoint = ["/usr/local/bin/offhook"],
+    entrypoint = ["/usr/local/bin/sloperator"],
     exposed_ports = ["5060/udp"],
-    tars = [":offhook_layer"],
+    tars = [":sloperator_layer"],
 )
 
 # Use --@//:repository=ghcr.io/owner/repo to override at push time.

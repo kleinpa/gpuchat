@@ -29,6 +29,7 @@ single_version_override(
 )
 bazel_dep(name = "yaml-cpp", version = "0.9.0")
 bazel_dep(name = "nlohmann_json", version = "3.12.0.bcr.1")
+bazel_dep(name = "opus", version = "1.6.0")
 
 # ── rules_foreign_cc toolchain: use system tools ──────────────────────────────
 register_toolchains(
@@ -53,6 +54,8 @@ http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "ht
 http_archive(
     name = "pjsip",
     build_file = "@//:third_party/pjsip/pjsip.BUILD",
+    patches = ["@//:third_party/pjsip/opus_include_path.patch"],
+    patch_args = ["-p1"],
     sha256 = "6140f7a97e318caa89c17e8d5468599671c6eed12d64a7c160dac879ba004c68",
     strip_prefix = "pjproject-2.14.1",
     urls = ["https://github.com/pjsip/pjproject/archive/refs/tags/2.14.1.tar.gz"],

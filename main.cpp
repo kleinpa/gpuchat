@@ -1,21 +1,21 @@
 // main.cpp — SIP voice chatbot server
 //
 // Stack
-//   • PJSUA2 (PJSIP C++ API)  — SIP / RTP / G.711 µ-law (PCMU) codec
+//   • PJSUA2 (PJSIP C++ API)  — SIP / RTP / Opus codec
 //   • Wyoming faster-whisper   — speech-to-text (VAD → PCM → transcript)
 //   • Ollama HTTP API          — LLM inference (streaming token output)
 //   • Wyoming piper            — text-to-speech (sentence → PCM audio)
 //
 // Audio flow
-//   RX: RTP/PCMU → PJSUA2 decode → PCM → VAD → Whisper → text
+//   RX: RTP/Opus → PJSUA2 decode → PCM → VAD → Whisper → text
 //   LLM: text → Ollama (streaming) → sentence tokens → Piper → PCM
-//   TX: PCM chunks → AudioQueue → onFrameRequested → RTP/PCMU
+//   TX: PCM chunks → AudioQueue → onFrameRequested → RTP/Opus
 //
 // Latency strategy
 //   • Piper synthesis starts on the first complete sentence from Ollama,
 //     not after the full LLM response.  Sentences are split on '.', '!', '?'.
 //   • PCM from Piper is queued in kFrameSamples-sized chunks.
-//   • VAD uses a simple RMS energy threshold; silence for kSilenceMs ms
+//   • VAD uses a simple RMS energy threshold; silence for vad.silence_ms ms
 //     triggers recognition.
 //
 // Concurrency
@@ -25,6 +25,7 @@
 #include <pjsua2.hpp>
 
 #include "chatbot_lib.hpp"
+#include "wyoming_lib.hpp"
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
@@ -65,24 +66,28 @@ ABSL_FLAG(std::string, ollama,      "http://ollama:11434",
           "Ollama HTTP endpoint");
 ABSL_FLAG(std::string, piper,       "piper:10200",
           "Wyoming piper TTS endpoint (host:port)");
-ABSL_FLAG(std::string, model,       "qwen3.5:9b",
-          "Ollama model name");
 ABSL_FLAG(std::string, config_file, "",
-          "Path to YAML config file (system_prompt, greeting_prompt, model params)");
+          "Path to YAML config file (model, system_prompt, greeting_prompt, vad, options)");
 ABSL_FLAG(std::string, pbx,        "",
           "SIP host for call transfers (e.g. 192.168.1.1 or pbx.local)");
 ABSL_FLAG(int,         port,        5060, "SIP listen port (UDP)");
 ABSL_FLAG(std::string, public_addr, "",
           "Public IP to advertise in SDP/Contact (for NAT)");
-ABSL_FLAG(int,         max_calls,   8,    "Maximum simultaneous SIP calls");
 
 // ── Runtime globals ───────────────────────────────────────────────────────────
 static std::string g_whisper_addr;  // host:port for Wyoming faster-whisper
 static std::string g_ollama_url;
 static std::string g_piper_addr;    // host:port for Wyoming piper
 static std::string g_pbx_host;      // SIP host used when building transfer URIs
-static std::string g_model;
+static std::string g_model         = "gemma3:1b";
 static std::string g_system_prompt;
+static int         g_max_calls     = 8;
+
+// Parsed once at startup from g_whisper_addr / g_piper_addr.
+static std::string g_whisper_host;
+static int         g_whisper_port = 10300;
+static std::string g_piper_host;
+static int         g_piper_port   = 10200;
 
 // ── Model options (populated from YAML config; passed verbatim to Ollama) ─────
 static nlohmann::json g_model_options = {
@@ -93,37 +98,18 @@ static nlohmann::json g_model_options = {
     {"repeat_penalty", 1.0},
 };
 
+// ── VAD tuning params (overridable via YAML config) ───────────────────────────
+static double g_vad_threshold = kVadThreshold;
+static int    g_silence_ms    = kSilenceMs;
+static int    g_min_speech_ms = kMinSpeechMs;
+
 // Pre-synthesized greeting — generated once at startup so calls start instantly.
 static std::vector<int16_t> g_greeting_pcm;
 static std::string          g_greeting_text;
 
 // ── TCP helpers (used by Wyoming protocol) ───────────────────────────────────
-
-static int ConnectTcp(const std::string &host, int port) {
-    struct addrinfo hints{}, *res = nullptr;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    std::string port_str = std::to_string(port);
-    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0) return -1;
-    int fd = -1;
-    for (auto *p = res; p; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
-    }
-    freeaddrinfo(res);
-    return fd;
-}
-
-static bool SendAll(int fd, const char *buf, size_t len) {
-    while (len > 0) {
-        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
-        if (n <= 0) return false;
-        buf += n; len -= n;
-    }
-    return true;
-}
+// (ConnectTcp, SendAll, ParseHostPort, WyomingSend, WyomingRecv are now in
+// wyoming_lib.hpp so they can be tested with mock servers.)
 
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
@@ -164,176 +150,23 @@ static bool HttpPostStream(const std::string &base_url,
 }
 
 // ── Wyoming protocol helpers ──────────────────────────────────────────────────
-
-// Parse "host:port" into components.
-static std::pair<std::string, int> ParseHostPort(const std::string &addr,
-                                                  int default_port) {
-    auto colon = addr.rfind(':');
-    if (colon == std::string::npos) return {addr, default_port};
-    return {addr.substr(0, colon), std::stoi(addr.substr(colon + 1))};
-}
-
-// Send one Wyoming frame: header JSON + optional data JSON + optional payload.
-static bool WyomingSend(int fd,
-                        const std::string &type,
-                        const std::string &data_json,   // "" if none
-                        const void *payload = nullptr,
-                        size_t payload_len = 0) {
-    std::string header = "{\"type\":\"" + type + "\",\"version\":\"1.8.0\"";
-    if (!data_json.empty())
-        header += ",\"data_length\":" + std::to_string(data_json.size());
-    if (payload && payload_len > 0)
-        header += ",\"payload_length\":" + std::to_string(payload_len);
-    header += "}\n";
-    if (!SendAll(fd, header.c_str(), header.size())) return false;
-    if (!data_json.empty() && !SendAll(fd, data_json.c_str(), data_json.size()))
-        return false;
-    if (payload && payload_len > 0 && !SendAll(fd, static_cast<const char*>(payload), payload_len))
-        return false;
-    return true;
-}
-
-// Read one Wyoming frame. Returns the event type; fills data_json and payload.
-static std::string WyomingRecv(int fd,
-                                std::string &data_json,
-                                std::vector<uint8_t> &payload) {
-    data_json.clear();
-    payload.clear();
-
-    // Read header line (terminated by '\n').
-    std::string header;
-    char ch;
-    while (recv(fd, &ch, 1, 0) == 1) {
-        if (ch == '\n') break;
-        header += ch;
-    }
-    if (header.empty()) return {};
-
-    std::string type = JsonGetString(header, "type");
-
-    // data_length
-    auto dl_pos = header.find("\"data_length\":");
-    if (dl_pos != std::string::npos) {
-        size_t dl = std::stoul(header.substr(dl_pos + 14));
-        if (dl > 0) {
-            data_json.resize(dl);
-            size_t got = 0;
-            while (got < dl) {
-                ssize_t n = recv(fd, &data_json[got], dl - got, 0);
-                if (n <= 0) return {};
-                got += n;
-            }
-        }
-    }
-
-    // payload_length
-    auto pl_pos = header.find("\"payload_length\":");
-    if (pl_pos != std::string::npos) {
-        size_t pl = std::stoul(header.substr(pl_pos + 17));
-        if (pl > 0) {
-            payload.resize(pl);
-            size_t got = 0;
-            while (got < pl) {
-                ssize_t n = recv(fd, payload.data() + got, pl - got, 0);
-                if (n <= 0) return {};
-                got += n;
-            }
-        }
-    }
-
-    return type;
-}
+// (ParseHostPort, WyomingSend, WyomingRecv are now in wyoming_lib.hpp.)
 
 // ── Wyoming services (STT + TTS) ─────────────────────────────────────────────
+// Thin wrappers that forward to wyoming_lib functions using the global config.
 static std::string Transcribe(const std::vector<int16_t> &pcm) {
     if (pcm.empty()) return {};
-    auto [host, port] = ParseHostPort(g_whisper_addr, 10300);
-    int fd = ConnectTcp(host, port);
-    if (fd < 0) { LOG(ERROR) << "[stt] connect failed: " << g_whisper_addr; return {}; }
-
-    // AudioChunk — send all PCM as one chunk at kAudioRate
-    std::string audio_data = "{\"rate\":" + std::to_string(kAudioRate)
-                           + ",\"width\":2,\"channels\":1,\"timestamp\":null}";
-    const void *raw = pcm.data();
-    size_t raw_len  = pcm.size() * sizeof(int16_t);
-    if (!WyomingSend(fd, "audio-chunk", audio_data, raw, raw_len)) {
-        close(fd); return {};
-    }
-    // AudioStop
-    if (!WyomingSend(fd, "audio-stop", "{\"timestamp\":null}")) {
-        close(fd); return {};
-    }
-
-    // Read until Transcript
-    std::string result;
-    for (int i = 0; i < 32; i++) {
-        std::string data_json;
-        std::vector<uint8_t> payload;
-        std::string type = WyomingRecv(fd, data_json, payload);
-        if (type.empty()) break;
-        if (type == "transcript") {
-            result = JsonGetString(data_json, "text");
-            break;
-        }
-        if (type == "error") {
-            LOG(ERROR) << "[stt] wyoming error: " << data_json;
-            break;
-        }
-    }
-    close(fd);
+    std::string result = WyomingTranscribe(pcm, g_whisper_host, g_whisper_port);
+    if (result.empty())
+        LOG(ERROR) << "[stt] connect failed or empty response: " << g_whisper_addr;
     return result;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 static std::vector<int16_t> Synthesize(const std::string &text) {
     if (text.empty()) return {};
-    auto [host, port] = ParseHostPort(g_piper_addr, 10200);
-    int fd = ConnectTcp(host, port);
-    if (fd < 0) { LOG(ERROR) << "[tts] connect failed: " << g_piper_addr; return {}; }
-
-    // Synthesize — include channels to avoid "# channels not specified" from piper
-    std::string synth_data = "{\"text\":\"" + JsonEscape(text) + "\",\"channels\":1}";
-    if (!WyomingSend(fd, "synthesize", synth_data)) {
-        close(fd); return {};
-    }
-
-    // Collect AudioChunk payloads until AudioStop
-    std::vector<int16_t> pcm;
-    int piper_rate = kAudioRate;
-    for (int i = 0; i < 4096; i++) {
-        std::string data_json;
-        std::vector<uint8_t> payload;
-        std::string type = WyomingRecv(fd, data_json, payload);
-        if (type.empty()) break;
-        if (type == "audio-start") {
-            auto rate_pos = data_json.find("\"rate\":");
-            if (rate_pos != std::string::npos)
-                piper_rate = std::stoi(data_json.substr(rate_pos + 7));
-        } else if (type == "audio-chunk") {
-            size_t n = payload.size() / 2;
-            size_t base = pcm.size();
-            pcm.resize(base + n);
-            memcpy(pcm.data() + base, payload.data(), payload.size());
-        } else if (type == "audio-stop") {
-            break;
-        } else if (type == "error") {
-            LOG(ERROR) << "[tts] wyoming error: " << data_json;
-            break;
-        }
-    }
-    close(fd);
-
-    if (pcm.empty()) { LOG(WARNING) << "[tts] empty response for: " << text; return {}; }
-
-    // Downsample if piper uses a different rate (e.g. 22050 → 8000)
-    if (piper_rate != kAudioRate) {
-        double ratio = static_cast<double>(piper_rate) / kAudioRate;
-        std::vector<int16_t> resampled;
-        resampled.reserve(static_cast<size_t>(pcm.size() / ratio) + 1);
-        for (size_t i = 0; i < pcm.size(); i += static_cast<size_t>(ratio))
-            resampled.push_back(pcm[i]);
-        return resampled;
-    }
+    auto pcm = WyomingSynthesize(text, g_piper_host, g_piper_port);
+    if (pcm.empty())
+        LOG(WARNING) << "[tts] empty response for: " << text;
     return pcm;
 }
 
@@ -357,6 +190,25 @@ static std::vector<int16_t> SynthesizeChime() {
             float sample   = kGain * envelope * std::sin(2.f * M_PI * freq * t);
             out.push_back(static_cast<int16_t>(sample * 32767.f));
         }
+    }
+    return out;
+}
+
+// Quick bright single note played the moment VAD enters listening state.
+static std::vector<int16_t> SynthesizeSttListeningChime() {
+    constexpr float kFreq     = 1047.0f;  // C6 — bright, high-pitched
+    constexpr float kDuration = 80.f;     // ms
+    constexpr float kDecay    = 10.0f;
+    constexpr float kGain     = 0.30f;
+
+    int n = static_cast<int>(kAudioRate * kDuration / 1000.f);
+    std::vector<int16_t> out;
+    out.reserve(n);
+    for (int i = 0; i < n; i++) {
+        float t        = static_cast<float>(i) / kAudioRate;
+        float envelope = std::exp(-kDecay * t);
+        float sample   = kGain * envelope * std::sin(2.f * M_PI * kFreq * t);
+        out.push_back(static_cast<int16_t>(sample * 32767.f));
     }
     return out;
 }
@@ -534,11 +386,16 @@ struct Session {
     }
 
     void Start() {
-        // Play chime then the pre-synthesized greeting immediately.
+        // Play chime then the pre-synthesized greeting immediately, followed by
+        // the listening chime to signal the mic is now active.
         auto chime = SynthesizeChime();
         audio_out.Push(chime.data(), chime.size());
         if (!g_greeting_pcm.empty())
             audio_out.Push(g_greeting_pcm.data(), g_greeting_pcm.size());
+        {
+            auto listen = SynthesizeSttListeningChime();
+            audio_out.Push(listen.data(), listen.size());
+        }
         if (!g_greeting_text.empty())
             AppendHistory("assistant", g_greeting_text);
 
@@ -677,13 +534,27 @@ struct Session {
                     transfer_fn(transfer_target);
                     active = false;
                 }
+            } else if (active) {
+                // Queue a listening chime after the TTS audio so the caller hears
+                // it when the assistant finishes speaking and the mic becomes active.
+                auto listen = SynthesizeSttListeningChime();
+                audio_out.Push(listen.data(), listen.size());
             }
         }
     }
 
     // Called from PJSUA2 audio thread.
     void ProcessRxFrame(const int16_t *samples, int n) {
-        if (vad.ProcessFrame(samples, n))
+        // Don't let incoming speech interrupt the assistant while it is talking.
+        // Any speech captured during playback is discarded — callers must wait
+        // for the assistant to finish before they can be heard.
+        if (audio_out.Size() > 0) {
+            vad.Reset();
+            return;
+        }
+
+        bool complete = vad.ProcessFrame(samples, n);
+        if (complete)
             SubmitUtterance(std::move(vad.ready));
     }
 };
@@ -757,6 +628,9 @@ public:
                 if (!session_) {
                     session_ = std::make_unique<Session>();
                     session_->caller = ci.remoteUri;
+                    session_->vad.vad_threshold = g_vad_threshold;
+                    session_->vad.silence_ms    = g_silence_ms;
+                    session_->vad.min_speech_ms = g_min_speech_ms;
                     pjsua_call_id cid = getId();
                     session_->transfer_fn = [cid](const std::string &ext) {
                         std::string uri = "sip:" + ext
@@ -828,10 +702,12 @@ int main(int argc, char *argv[]) {
     g_ollama_url   = absl::GetFlag(FLAGS_ollama);
     g_piper_addr   = absl::GetFlag(FLAGS_piper);
     g_pbx_host     = absl::GetFlag(FLAGS_pbx);
-    g_model        = absl::GetFlag(FLAGS_model);
     int sip_port  = absl::GetFlag(FLAGS_port);
     std::string public_addr = absl::GetFlag(FLAGS_public_addr);
-    int max_calls = absl::GetFlag(FLAGS_max_calls);
+
+    // Pre-parse Wyoming addresses so all Transcribe/Synthesize calls use them.
+    std::tie(g_whisper_host, g_whisper_port) = ParseHostPort(g_whisper_addr, 10300);
+    std::tie(g_piper_host,   g_piper_port)   = ParseHostPort(g_piper_addr,   10200);
 
     static constexpr char kDefaultSystemPrompt[] =
         "You are a helpful voice assistant answering a phone call. "
@@ -860,6 +736,16 @@ int main(int argc, char *argv[]) {
                 greeting_prompt = cfg["greeting_prompt"].as<std::string>();
             if (cfg["model"] && !cfg["model"].as<std::string>().empty())
                 g_model = cfg["model"].as<std::string>();
+            if (cfg["max_calls"] && cfg["max_calls"].IsScalar())
+                g_max_calls = cfg["max_calls"].as<int>();
+
+            // VAD tuning — all three fields are optional.
+            if (cfg["vad"] && cfg["vad"].IsMap()) {
+                const YAML::Node &vad = cfg["vad"];
+                if (vad["threshold"])  g_vad_threshold = vad["threshold"].as<double>();
+                if (vad["silence_ms"]) g_silence_ms    = vad["silence_ms"].as<int>();
+                if (vad["min_speech_ms"]) g_min_speech_ms = vad["min_speech_ms"].as<int>();
+            }
 
             // Any key under the "options" mapping is forwarded to Ollama.
             // Values are passed as-is; yaml-cpp preserves numeric types.
@@ -917,7 +803,7 @@ int main(int argc, char *argv[]) {
         ep.libCreate();
 
         pj::EpConfig cfg;
-        cfg.uaConfig.maxCalls      = max_calls;
+        cfg.uaConfig.maxCalls      = g_max_calls;
         cfg.logConfig.level        = 3;
         cfg.logConfig.consoleLevel = 3;
         cfg.medConfig.clockRate    = kAudioRate;
@@ -934,8 +820,9 @@ int main(int argc, char *argv[]) {
 
         ep.libStart();
         ep.audDevManager().setNullDev();
-        ep.codecSetPriority("PCMU/8000", 255);
-        ep.codecSetPriority("PCMA/8000", 254);
+        // Opus is the only codec; G.711 is disabled at compile time.
+        ep.codecSetPriority("opus/48000/2", 255);
+        LOG(INFO) << "[codec] Opus enabled (priority 255)";
 
         {
             pj::AccountConfig account_cfg;
