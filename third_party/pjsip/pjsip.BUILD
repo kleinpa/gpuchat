@@ -56,7 +56,6 @@ configure_make(
         # references to EVP_*/RAND_bytes/ERR_* at link time.
         "ac_cv_lib_ssl_SSL_CTX_new=no",
         "ac_cv_header_openssl_ssl_h=no",
-        "CFLAGS=-O2",
         # Include -std=c++17 here to match the --action_env=CXXFLAGS=-std=c++17
         # set in .bazelrc. Without it, this override would strip the C++ standard
         # flag from PJSUA2's C++ compilation units.
@@ -66,11 +65,19 @@ configure_make(
         # a standalone argument, causing aconfigure to error with
         # "unrecognized option: -O2".
         "CXXFLAGS=-std=c++17",
-        # Clear LDFLAGS: rules_foreign_cc injects gcc-style linker flags
-        # (e.g. -Wl,-S, -fuse-ld=gold) that /usr/bin/ld rejects when PJSIP
-        # links its internal test binaries directly with ld.
-        "LDFLAGS=",
+        # CFLAGS and LDFLAGS are set via the env attribute below so they can
+        # reference $$EXT_BUILD_DEPS (rules_foreign_cc supports multi-word values
+        # in env but not in configure_options, which are each a single shell word).
     ],
+    # CFLAGS: add -O2 optimization and expose Opus headers staged by @opus//:opus.
+    # LDFLAGS: add the Opus static-lib search path; this also overrides the
+    # gcc-style linker flags rules_foreign_cc injects (e.g. -Wl,-S,
+    # -fuse-ld=gold) that /usr/bin/ld rejects when PJSIP links internal test
+    # binaries directly with ld.
+    env = {
+        "CFLAGS": "-O2 -I$$EXT_BUILD_DEPS/include",
+        "LDFLAGS": "-L$$EXT_BUILD_DEPS/lib",
+    },
     # Use 'lib' instead of 'all' to build only library directories,
     # avoiding test binaries that fail when ld receives gcc-style LDFLAGS.
     targets = ["dep", "lib", "install"],
@@ -109,15 +116,11 @@ configure_make(
         "libresample-x86_64-unknown-linux-gnu.a",
         "libwebrtc-x86_64-unknown-linux-gnu.a",
     ],
-    # No -lasound: --disable-sound means modem-server has no ALSA runtime dep.
-    # @libuuid//:libuuid is listed here so it propagates transitively to any
-    # cc_binary (e.g. modem-server) that links against pjsip. libpj uses
-    # uuid_generate/uuid_unparse from libuuid when the system uuid-dev is
-    # present during configure; the Bazel dep satisfies those symbols at link
-    # time without requiring a system libuuid.so at runtime.
-    deps = ["@libuuid//:libuuid"],
+    # @libuuid//:libuuid and @opus//:opus are listed here so they propagate
+    # transitively to any cc_binary that links against pjsip and so their
+    # headers and static libs are staged in $EXT_BUILD_DEPS during this build.
+    deps = ["@libuuid//:libuuid", "@opus//:opus"],
     linkopts = [
-        "-lopus",
         "-lm",
         "-lrt",
         "-lpthread",
