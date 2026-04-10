@@ -364,6 +364,25 @@ static std::vector<int16_t> SynthesizeChime() {
     return out;
 }
 
+// Quick bright single note played the moment VAD enters listening state.
+static std::vector<int16_t> SynthesizeSttListeningChime() {
+    constexpr float kFreq     = 1047.0f;  // C6 — bright, high-pitched
+    constexpr float kDuration = 80.f;     // ms
+    constexpr float kDecay    = 10.0f;
+    constexpr float kGain     = 0.30f;
+
+    int n = static_cast<int>(kAudioRate * kDuration / 1000.f);
+    std::vector<int16_t> out;
+    out.reserve(n);
+    for (int i = 0; i < n; i++) {
+        float t        = static_cast<float>(i) / kAudioRate;
+        float envelope = std::exp(-kDecay * t);
+        float sample   = kGain * envelope * std::sin(2.f * M_PI * kFreq * t);
+        out.push_back(static_cast<int16_t>(sample * 32767.f));
+    }
+    return out;
+}
+
 // Short single low-pitched click played when VAD captures an utterance.
 static std::vector<int16_t> SynthesizeSegmentChime() {
     constexpr float kFreq     = 330.0f;   // E4 — lower than the answer chime
@@ -686,8 +705,21 @@ struct Session {
 
     // Called from PJSUA2 audio thread.
     void ProcessRxFrame(const int16_t *samples, int n) {
-        if (vad.ProcessFrame(samples, n))
+        // Don't let incoming speech interrupt the assistant while it is talking.
+        if (audio_out.Size() > 0) {
+            vad.Reset();
+            return;
+        }
+
+        bool was_listening = vad.in_speech;
+        if (vad.ProcessFrame(samples, n)) {
             SubmitUtterance(std::move(vad.ready));
+        } else if (!was_listening && vad.in_speech) {
+            // VAD just detected speech onset — play a bright chime so the caller
+            // knows the system has started listening.
+            auto chime = SynthesizeSttListeningChime();
+            audio_out.Push(chime.data(), chime.size());
+        }
     }
 };
 
