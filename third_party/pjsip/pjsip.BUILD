@@ -6,10 +6,11 @@ filegroup(
     visibility = ["//visibility:private"],
 )
 
-# PJSIP 2.14.1 — stripped down to SIP signalling + G.711 audio only.
+# PJSIP 2.14.1 — stripped down to SIP signalling + Opus audio only.
 #
 # What we keep vs remove:
-#   KEEP    G.711 µ-law / A-law  — the only codec used by the modem (PCMU/PCMA)
+#   KEEP    Opus                 — the codec used for high-quality wideband audio
+#   KEEP    G.711 µ-law / A-law  — kept as fallback (priority set to 0 at runtime)
 #   KEEP    pjmedia conference bridge + custom AudioMediaPort
 #   KEEP    null audio device  — modem-server calls setNullDev(); no ALSA needed
 #   REMOVE  ALSA / PortAudio   — --disable-sound → no libasound2 runtime dep
@@ -116,6 +117,7 @@ configure_make(
     # time without requiring a system libuuid.so at runtime.
     deps = ["@libuuid//:libuuid"],
     linkopts = [
+        "-lopus",
         "-lm",
         "-lrt",
         "-lpthread",

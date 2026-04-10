@@ -27,9 +27,9 @@
 #include <vector>
 
 // ── Audio constants ───────────────────────────────────────────────────────────
-static constexpr int kAudioRate    = 8000;
+static constexpr int kAudioRate    = 16000;
 static constexpr int kFrameMs      = 20;
-static constexpr int kFrameSamples = kAudioRate * kFrameMs / 1000;  // 160
+static constexpr int kFrameSamples = kAudioRate * kFrameMs / 1000;  // 320
 
 // ── VAD constants ─────────────────────────────────────────────────────────────
 static constexpr double kVadThreshold = 500.0;

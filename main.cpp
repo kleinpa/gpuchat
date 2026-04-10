@@ -1,15 +1,15 @@
 // main.cpp — SIP voice chatbot server
 //
 // Stack
-//   • PJSUA2 (PJSIP C++ API)  — SIP / RTP / G.711 µ-law (PCMU) codec
+//   • PJSUA2 (PJSIP C++ API)  — SIP / RTP / Opus codec
 //   • Wyoming faster-whisper   — speech-to-text (VAD → PCM → transcript)
 //   • Ollama HTTP API          — LLM inference (streaming token output)
 //   • Wyoming piper            — text-to-speech (sentence → PCM audio)
 //
 // Audio flow
-//   RX: RTP/PCMU → PJSUA2 decode → PCM → VAD → Whisper → text
+//   RX: RTP/Opus → PJSUA2 decode → PCM → VAD → Whisper → text
 //   LLM: text → Ollama (streaming) → sentence tokens → Piper → PCM
-//   TX: PCM chunks → AudioQueue → onFrameRequested → RTP/PCMU
+//   TX: PCM chunks → AudioQueue → onFrameRequested → RTP/Opus
 //
 // Latency strategy
 //   • Piper synthesis starts on the first complete sentence from Ollama,
@@ -948,8 +948,11 @@ int main(int argc, char *argv[]) {
 
         ep.libStart();
         ep.audDevManager().setNullDev();
-        ep.codecSetPriority("PCMU/8000", 255);
-        ep.codecSetPriority("PCMA/8000", 254);
+        // "opus/48000/2" is the PJSIP-registered codec ID (always 48 kHz/stereo);
+        // PJSIP's conference bridge resamples to/from kAudioRate internally.
+        ep.codecSetPriority("opus/48000/2", 255);
+        ep.codecSetPriority("PCMU/8000", 0);
+        ep.codecSetPriority("PCMA/8000", 0);
 
         {
             pj::AccountConfig account_cfg;
