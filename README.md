@@ -1,4 +1,4 @@
-# offhook
+# sloperator
 
 SIP voice assistant: answers calls, transcribes speech with faster-whisper,
 generates responses with Ollama, and speaks replies back with Piper TTS.
@@ -41,17 +41,17 @@ newline-delimited JSON + binary framing over plain TCP.
 ## Build
 
 ```sh
-bazel build -c opt //:offhook
+bazel build -c opt //:sloperator
 ```
 
 ## Usage
 
 ```sh
 # Minimal — all services on localhost with defaults
-bazel run //:offhook
+bazel run //:sloperator
 
 # Custom endpoints and config file
-bazel run //:offhook -- \
+bazel run //:sloperator -- \
   --whisper     whisper:10300 \
   --ollama      http://ollama:11434 \
   --piper       piper:10200 \

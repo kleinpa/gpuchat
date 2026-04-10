@@ -10,10 +10,10 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-# ── offhook binary ────────────────────────────────────────────────────────
+# ── sloperator binary ────────────────────────────────────────────────────────
 
 cc_binary(
-    name = "offhook",
+    name = "sloperator",
     srcs = ["main.cpp"],
     linkopts = [
         "-ldl",
@@ -42,17 +42,17 @@ cc_binary(
 # ── OCI container image ───────────────────────────────────────────────────────
 
 pkg_tar(
-    name = "offhook_layer",
-    srcs = [":offhook"],
+    name = "sloperator_layer",
+    srcs = [":sloperator"],
     package_dir = "/usr/local/bin",
 )
 
 oci_image(
     name = "image",
     base = "@distroless_cc",
-    entrypoint = ["/usr/local/bin/offhook"],
+    entrypoint = ["/usr/local/bin/sloperator"],
     exposed_ports = ["5060/udp"],
-    tars = [":offhook_layer"],
+    tars = [":sloperator_layer"],
 )
 
 # Use --@//:repository=ghcr.io/owner/repo to override at push time.

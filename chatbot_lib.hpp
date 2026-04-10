@@ -1,5 +1,5 @@
 #pragma once
-// chatbot_lib.hpp — pure utility functions for offhook
+// chatbot_lib.hpp — pure utility functions for sloperator
 //
 // All functions here are free of network I/O and PJSIP dependencies so they
 // can be unit-tested without any external services or SIP infrastructure.

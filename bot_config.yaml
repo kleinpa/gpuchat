@@ -1,4 +1,4 @@
-# offhook configuration
+# sloperator configuration
 # Pass this file with --config_file=bot_config.yaml
 #
 # All fields are optional; omitted ones use built-in defaults.
