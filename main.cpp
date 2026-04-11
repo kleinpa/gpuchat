@@ -556,11 +556,16 @@ struct Session {
     }
 
     void Start() {
-        // Play chime then the pre-synthesized greeting immediately.
+        // Play chime then the pre-synthesized greeting immediately, followed by
+        // the listening chime to signal the mic is now active.
         auto chime = SynthesizeChime();
         audio_out.Push(chime.data(), chime.size());
         if (!g_greeting_pcm.empty())
             audio_out.Push(g_greeting_pcm.data(), g_greeting_pcm.size());
+        {
+            auto listen = SynthesizeSttListeningChime();
+            audio_out.Push(listen.data(), listen.size());
+        }
         if (!g_greeting_text.empty())
             AppendHistory("assistant", g_greeting_text);
 
@@ -699,6 +704,11 @@ struct Session {
                     transfer_fn(transfer_target);
                     active = false;
                 }
+            } else if (active) {
+                // Queue a listening chime after the TTS audio so the caller hears
+                // it when the assistant finishes speaking and the mic becomes active.
+                auto listen = SynthesizeSttListeningChime();
+                audio_out.Push(listen.data(), listen.size());
             }
         }
     }
@@ -713,16 +723,7 @@ struct Session {
             return;
         }
 
-        bool was_listening = vad.in_speech;
         bool complete = vad.ProcessFrame(samples, n);
-
-        // Play a bright chime at the moment the VAD first enters speech state so
-        // the caller gets immediate audible feedback that the mic is active.
-        if (!was_listening && vad.in_speech) {
-            auto chime = SynthesizeSttListeningChime();
-            audio_out.Push(chime.data(), chime.size());
-        }
-
         if (complete)
             SubmitUtterance(std::move(vad.ready));
     }
