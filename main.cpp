@@ -25,6 +25,7 @@
 #include <pjsua2.hpp>
 
 #include "chatbot_lib.hpp"
+#include "wyoming_lib.hpp"
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
@@ -82,6 +83,12 @@ static std::string g_model         = "gemma3:1b";
 static std::string g_system_prompt;
 static int         g_max_calls     = 8;
 
+// Parsed once at startup from g_whisper_addr / g_piper_addr.
+static std::string g_whisper_host;
+static int         g_whisper_port = 10300;
+static std::string g_piper_host;
+static int         g_piper_port   = 10200;
+
 // ── Model options (populated from YAML config; passed verbatim to Ollama) ─────
 static nlohmann::json g_model_options = {
     {"temperature",    0.2},
@@ -101,32 +108,8 @@ static std::vector<int16_t> g_greeting_pcm;
 static std::string          g_greeting_text;
 
 // ── TCP helpers (used by Wyoming protocol) ───────────────────────────────────
-
-static int ConnectTcp(const std::string &host, int port) {
-    struct addrinfo hints{}, *res = nullptr;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    std::string port_str = std::to_string(port);
-    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0) return -1;
-    int fd = -1;
-    for (auto *p = res; p; p = p->ai_next) {
-        fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
-        close(fd); fd = -1;
-    }
-    freeaddrinfo(res);
-    return fd;
-}
-
-static bool SendAll(int fd, const char *buf, size_t len) {
-    while (len > 0) {
-        ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
-        if (n <= 0) return false;
-        buf += n; len -= n;
-    }
-    return true;
-}
+// (ConnectTcp, SendAll, ParseHostPort, WyomingSend, WyomingRecv are now in
+// wyoming_lib.hpp so they can be tested with mock servers.)
 
 // ── HTTP client ───────────────────────────────────────────────────────────────
 
@@ -167,176 +150,23 @@ static bool HttpPostStream(const std::string &base_url,
 }
 
 // ── Wyoming protocol helpers ──────────────────────────────────────────────────
-
-// Parse "host:port" into components.
-static std::pair<std::string, int> ParseHostPort(const std::string &addr,
-                                                  int default_port) {
-    auto colon = addr.rfind(':');
-    if (colon == std::string::npos) return {addr, default_port};
-    return {addr.substr(0, colon), std::stoi(addr.substr(colon + 1))};
-}
-
-// Send one Wyoming frame: header JSON + optional data JSON + optional payload.
-static bool WyomingSend(int fd,
-                        const std::string &type,
-                        const std::string &data_json,   // "" if none
-                        const void *payload = nullptr,
-                        size_t payload_len = 0) {
-    std::string header = "{\"type\":\"" + type + "\",\"version\":\"1.8.0\"";
-    if (!data_json.empty())
-        header += ",\"data_length\":" + std::to_string(data_json.size());
-    if (payload && payload_len > 0)
-        header += ",\"payload_length\":" + std::to_string(payload_len);
-    header += "}\n";
-    if (!SendAll(fd, header.c_str(), header.size())) return false;
-    if (!data_json.empty() && !SendAll(fd, data_json.c_str(), data_json.size()))
-        return false;
-    if (payload && payload_len > 0 && !SendAll(fd, static_cast<const char*>(payload), payload_len))
-        return false;
-    return true;
-}
-
-// Read one Wyoming frame. Returns the event type; fills data_json and payload.
-static std::string WyomingRecv(int fd,
-                                std::string &data_json,
-                                std::vector<uint8_t> &payload) {
-    data_json.clear();
-    payload.clear();
-
-    // Read header line (terminated by '\n').
-    std::string header;
-    char ch;
-    while (recv(fd, &ch, 1, 0) == 1) {
-        if (ch == '\n') break;
-        header += ch;
-    }
-    if (header.empty()) return {};
-
-    std::string type = JsonGetString(header, "type");
-
-    // data_length
-    auto dl_pos = header.find("\"data_length\":");
-    if (dl_pos != std::string::npos) {
-        size_t dl = std::stoul(header.substr(dl_pos + 14));
-        if (dl > 0) {
-            data_json.resize(dl);
-            size_t got = 0;
-            while (got < dl) {
-                ssize_t n = recv(fd, &data_json[got], dl - got, 0);
-                if (n <= 0) return {};
-                got += n;
-            }
-        }
-    }
-
-    // payload_length
-    auto pl_pos = header.find("\"payload_length\":");
-    if (pl_pos != std::string::npos) {
-        size_t pl = std::stoul(header.substr(pl_pos + 17));
-        if (pl > 0) {
-            payload.resize(pl);
-            size_t got = 0;
-            while (got < pl) {
-                ssize_t n = recv(fd, payload.data() + got, pl - got, 0);
-                if (n <= 0) return {};
-                got += n;
-            }
-        }
-    }
-
-    return type;
-}
+// (ParseHostPort, WyomingSend, WyomingRecv are now in wyoming_lib.hpp.)
 
 // ── Wyoming services (STT + TTS) ─────────────────────────────────────────────
+// Thin wrappers that forward to wyoming_lib functions using the global config.
 static std::string Transcribe(const std::vector<int16_t> &pcm) {
     if (pcm.empty()) return {};
-    auto [host, port] = ParseHostPort(g_whisper_addr, 10300);
-    int fd = ConnectTcp(host, port);
-    if (fd < 0) { LOG(ERROR) << "[stt] connect failed: " << g_whisper_addr; return {}; }
-
-    // AudioChunk — send all PCM as one chunk at kAudioRate
-    std::string audio_data = "{\"rate\":" + std::to_string(kAudioRate)
-                           + ",\"width\":2,\"channels\":1,\"timestamp\":null}";
-    const void *raw = pcm.data();
-    size_t raw_len  = pcm.size() * sizeof(int16_t);
-    if (!WyomingSend(fd, "audio-chunk", audio_data, raw, raw_len)) {
-        close(fd); return {};
-    }
-    // AudioStop
-    if (!WyomingSend(fd, "audio-stop", "{\"timestamp\":null}")) {
-        close(fd); return {};
-    }
-
-    // Read until Transcript
-    std::string result;
-    for (int i = 0; i < 32; i++) {
-        std::string data_json;
-        std::vector<uint8_t> payload;
-        std::string type = WyomingRecv(fd, data_json, payload);
-        if (type.empty()) break;
-        if (type == "transcript") {
-            result = JsonGetString(data_json, "text");
-            break;
-        }
-        if (type == "error") {
-            LOG(ERROR) << "[stt] wyoming error: " << data_json;
-            break;
-        }
-    }
-    close(fd);
+    std::string result = WyomingTranscribe(pcm, g_whisper_host, g_whisper_port);
+    if (result.empty())
+        LOG(ERROR) << "[stt] connect failed or empty response: " << g_whisper_addr;
     return result;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 static std::vector<int16_t> Synthesize(const std::string &text) {
     if (text.empty()) return {};
-    auto [host, port] = ParseHostPort(g_piper_addr, 10200);
-    int fd = ConnectTcp(host, port);
-    if (fd < 0) { LOG(ERROR) << "[tts] connect failed: " << g_piper_addr; return {}; }
-
-    // Synthesize — include channels to avoid "# channels not specified" from piper
-    std::string synth_data = "{\"text\":\"" + JsonEscape(text) + "\",\"channels\":1}";
-    if (!WyomingSend(fd, "synthesize", synth_data)) {
-        close(fd); return {};
-    }
-
-    // Collect AudioChunk payloads until AudioStop
-    std::vector<int16_t> pcm;
-    int piper_rate = kAudioRate;
-    for (int i = 0; i < 4096; i++) {
-        std::string data_json;
-        std::vector<uint8_t> payload;
-        std::string type = WyomingRecv(fd, data_json, payload);
-        if (type.empty()) break;
-        if (type == "audio-start") {
-            auto rate_pos = data_json.find("\"rate\":");
-            if (rate_pos != std::string::npos)
-                piper_rate = std::stoi(data_json.substr(rate_pos + 7));
-        } else if (type == "audio-chunk") {
-            size_t n = payload.size() / 2;
-            size_t base = pcm.size();
-            pcm.resize(base + n);
-            memcpy(pcm.data() + base, payload.data(), payload.size());
-        } else if (type == "audio-stop") {
-            break;
-        } else if (type == "error") {
-            LOG(ERROR) << "[tts] wyoming error: " << data_json;
-            break;
-        }
-    }
-    close(fd);
-
-    if (pcm.empty()) { LOG(WARNING) << "[tts] empty response for: " << text; return {}; }
-
-    // Downsample if piper uses a different rate (e.g. 22050 → 8000)
-    if (piper_rate != kAudioRate) {
-        double ratio = static_cast<double>(piper_rate) / kAudioRate;
-        std::vector<int16_t> resampled;
-        resampled.reserve(static_cast<size_t>(pcm.size() / ratio) + 1);
-        for (size_t i = 0; i < pcm.size(); i += static_cast<size_t>(ratio))
-            resampled.push_back(pcm[i]);
-        return resampled;
-    }
+    auto pcm = WyomingSynthesize(text, g_piper_host, g_piper_port);
+    if (pcm.empty())
+        LOG(WARNING) << "[tts] empty response for: " << text;
     return pcm;
 }
 
@@ -875,6 +705,10 @@ int main(int argc, char *argv[]) {
     int sip_port  = absl::GetFlag(FLAGS_port);
     std::string public_addr = absl::GetFlag(FLAGS_public_addr);
 
+    // Pre-parse Wyoming addresses so all Transcribe/Synthesize calls use them.
+    std::tie(g_whisper_host, g_whisper_port) = ParseHostPort(g_whisper_addr, 10300);
+    std::tie(g_piper_host,   g_piper_port)   = ParseHostPort(g_piper_addr,   10200);
+
     static constexpr char kDefaultSystemPrompt[] =
         "You are a helpful voice assistant answering a phone call. "
         "Keep all responses short and conversational — one to three sentences at most. "
@@ -986,11 +820,21 @@ int main(int argc, char *argv[]) {
 
         ep.libStart();
         ep.audDevManager().setNullDev();
-        // "opus/48000/2" is the PJSIP-registered codec ID (always 48 kHz/stereo);
-        // PJSIP's conference bridge resamples to/from kAudioRate internally.
-        ep.codecSetPriority("opus/48000/2", 255);
-        ep.codecSetPriority("PCMU/8000", 0);
-        ep.codecSetPriority("PCMA/8000", 0);
+        // Prefer Opus (48 kHz/stereo on the wire; bridge resamples to kAudioRate
+        // internally).  Fall back to PCMU/8000 when Opus is not compiled into
+        // PJSIP (PJ_ENOTFOUND), so the binary still starts and handles calls.
+        bool opus_available = false;
+        try {
+            ep.codecSetPriority("opus/48000/2", 255);
+            opus_available = true;
+            LOG(INFO) << "[codec] Opus enabled (priority 255)";
+        } catch (pj::Error &ce) {
+            LOG(WARNING) << "[codec] Opus not registered (" << ce.info()
+                         << "); falling back to G.711";
+        }
+        // Disable G.711 when Opus is available; keep PCMU as fallback otherwise.
+        try { ep.codecSetPriority("PCMU/8000", opus_available ? 0 : 255); } catch (...) {}
+        try { ep.codecSetPriority("PCMA/8000", 0); } catch (...) {}
 
         {
             pj::AccountConfig account_cfg;

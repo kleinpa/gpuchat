@@ -5,6 +5,7 @@ cc_test(
     srcs = ["test_chatbot.cpp"],
     deps = [
         "//:chatbot_lib",
+        "//:wyoming_lib",
         "@googletest//:gtest_main",
     ],
 )

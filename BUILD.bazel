@@ -10,6 +10,17 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+# ── Wyoming protocol client library ──────────────────────────────────────────
+# Network-I/O layer: Wyoming TCP helpers + WyomingTranscribe / WyomingSynthesize.
+# Depends on chatbot_lib for kAudioRate, JsonGetString, JsonEscape.
+
+cc_library(
+    name = "wyoming_lib",
+    hdrs = ["wyoming_lib.hpp"],
+    deps = [":chatbot_lib"],
+    visibility = ["//visibility:public"],
+)
+
 # ── sloperator binary ────────────────────────────────────────────────────────
 
 cc_binary(
@@ -26,6 +37,7 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":chatbot_lib",
+        ":wyoming_lib",
         "@abseil-cpp//absl/flags:flag",
         "@abseil-cpp//absl/flags:parse",
         "@abseil-cpp//absl/flags:usage",
