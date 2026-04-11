@@ -6,15 +6,34 @@ load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 
 cc_library(
     name = "chatbot_lib",
-    hdrs = ["chatbot_lib.hpp"],
+    hdrs = ["chatbot_lib.h"],
     visibility = ["//visibility:public"],
+)
+
+# ── Bot core library ─────────────────────────────────────────────────────────
+#
+# All chatbot logic: Wyoming/Ollama helpers, audio cues, Session, BotAudioPort,
+# BotCall, BotAccount, MakeRealServices().  Linked by the binary and the test.
+
+cc_library(
+    name = "bot_core",
+    srcs = ["bot_core.cc"],
+    hdrs = ["bot_core.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":chatbot_lib",
+        "@abseil-cpp//absl/log",
+        "@cpp-httplib//:httplib",
+        "@nlohmann_json//:json",
+        "@pjsip",
+    ],
 )
 
 # ── sloperator binary ────────────────────────────────────────────────────────
 
 cc_binary(
     name = "sloperator",
-    srcs = ["main.cpp"],
+    srcs = ["main.cc"],
     linkopts = [
         "-ldl",
         "-lpthread",
@@ -25,15 +44,13 @@ cc_binary(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        ":chatbot_lib",
+        ":bot_core",
         "@abseil-cpp//absl/flags:flag",
         "@abseil-cpp//absl/flags:parse",
         "@abseil-cpp//absl/flags:usage",
         "@abseil-cpp//absl/log",
         "@abseil-cpp//absl/log:globals",
         "@abseil-cpp//absl/log:initialize",
-        "@cpp-httplib//:httplib",
-        "@nlohmann_json//:json",
         "@pjsip",
         "@yaml-cpp//:yaml-cpp",
     ],

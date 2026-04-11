@@ -2,9 +2,37 @@ load("@rules_cc//cc:defs.bzl", "cc_test")
 
 cc_test(
     name = "test_chatbot",
-    srcs = ["test_chatbot.cpp"],
+    srcs = ["test_chatbot.cc"],
     deps = [
         "//:chatbot_lib",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# End-to-end test: pipeline tests (no network) + SIP answer test (optional).
+#
+# PipelineTest: injects fake Services into Session directly — runs always.
+# SipAnswerTest: launches sloperator as a subprocess — skipped unless
+#   SLOPERATOR_BIN is set (or the binary is found in TEST_SRCDIR/_main/).
+#
+# Run with:
+#   bazel test //tests:test_e2e_sip
+#
+# exclusive: binds fixed localhost ports for SipAnswerTest.
+# local: needs fork/exec for the subprocess test.
+cc_test(
+    name = "test_e2e_sip",
+    srcs = ["test_e2e_sip.cc"],
+    data = ["//:sloperator"],
+    tags = ["exclusive", "local"],
+    linkopts = [
+        "-ldl",
+        "-lpthread",
+        "-lm",
+        "-lrt",
+    ],
+    deps = [
+        "//:bot_core",
         "@googletest//:gtest_main",
     ],
 )

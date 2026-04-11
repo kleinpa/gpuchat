@@ -6,15 +6,15 @@ filegroup(
     visibility = ["//visibility:private"],
 )
 
-# PJSIP 2.14.1 — stripped down to SIP signalling + G.711 audio only.
+# PJSIP 2.14.1 — stripped down to SIP signalling + G.722 wideband audio only.
 #
 # What we keep vs remove:
-#   KEEP    G.711 µ-law / A-law  — the only codec used by the modem (PCMU/PCMA)
+#   KEEP    G.722 wideband (16 kHz)  — the only codec used (payload type 9)
 #   KEEP    pjmedia conference bridge + custom AudioMediaPort
 #   KEEP    null audio device  — modem-server calls setNullDev(); no ALSA needed
 #   REMOVE  ALSA / PortAudio   — --disable-sound → no libasound2 runtime dep
 #   REMOVE  Speex AEC          -- we set ecTailLen = 0, so no echo canceller
-#   REMOVE  GSM / Speex / iLBC / L16 / G.722 / G.722.1 codecs
+#   REMOVE  GSM / Speex / iLBC / L16 / G.711 / G.722.1 codecs
 #   REMOVE  OpenSSL / TLS
 #   REMOVE  Video pipeline
 #
@@ -39,7 +39,7 @@ configure_make(
         "--disable-speex-codec",  # Speex (disabled; not registered, cannot set priority)
         "--disable-ilbc-codec",   # iLBC (disabled; not registered, cannot set priority)
         "--disable-l16-codec",    # Linear PCM 16-bit (not used)
-        "--disable-g722-codec",   # G.722 wideband (not used)
+        # G.722 is KEPT — it is our only codec (16 kHz wideband, PT=9)
         "--disable-g7221-codec",  # G.722.1 (not used)
         # ── audio device stripping ───────────────────────────────────────────
         # Disables all sound backends (ALSA, PortAudio).
